@@ -26,6 +26,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
@@ -109,6 +110,22 @@ def normalize_text(raw: str) -> str:
     return "\n".join(lines)
 
 
+def wait_out_waiting_room(page, max_wait_ms: int = 150000) -> None:
+    """Alguns acessos caem numa 'Sala de Espera Virtual' (sistema anti-robô
+    tipo CrowdHandler) antes de liberar a página real. Fica esperando e
+    verificando periodicamente até sair dela, em vez de desistir na hora."""
+    start = time.time()
+    while (time.time() - start) * 1000 < max_wait_ms:
+        title = (page.title() or "").lower()
+        url = page.url.lower()
+        if "espera" not in title and "crowdhandler" not in url and "waitingroom" not in url:
+            return
+        elapsed = int(time.time() - start)
+        log(f"Ainda na sala de espera virtual (título: {page.title()!r}) — aguardando... ({elapsed}s)")
+        page.wait_for_timeout(5000)
+    log("Tempo máximo de espera na sala de espera virtual atingido, seguindo mesmo assim.")
+
+
 def find_login_fields(page):
     """Procura os campos de usuário/senha na página principal E dentro de
     qualquer iframe (alguns portais colocam o formulário de login em um
@@ -154,6 +171,7 @@ def login_and_get_text() -> str:
 
         log(f"Abrindo {LOGIN_URL}")
         page.goto(LOGIN_URL, wait_until="load", timeout=60000)
+        wait_out_waiting_room(page)
 
         # A página tenta redirecionar via JS para segurancaapi.appai.org.br
         # (tela de login OAuth). Esperamos essa troca de URL acontecer.
@@ -162,6 +180,8 @@ def login_and_get_text() -> str:
             log("Redirecionado para o servidor de login (segurancaapi).")
         except Exception:
             log("Não foi redirecionado automaticamente para segurancaapi dentro do tempo esperado.")
+
+        wait_out_waiting_room(page)
 
         try:
             page.wait_for_load_state("networkidle", timeout=20000)
@@ -208,11 +228,13 @@ def login_and_get_text() -> str:
         except Exception:
             log("networkidle não atingido após login, seguindo mesmo assim.")
         page.wait_for_timeout(2000)
+        wait_out_waiting_room(page)
         log("Login enviado.")
         log(f"URL após login: {page.url}")
 
         log(f"Abrindo {TARGET_URL}")
         page.goto(TARGET_URL, wait_until="networkidle", timeout=60000)
+        wait_out_waiting_room(page)
         # espera extra pra SPA terminar de renderizar a lista
         page.wait_for_timeout(4000)
 

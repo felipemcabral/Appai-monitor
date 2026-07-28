@@ -34,7 +34,7 @@ from playwright.sync_api import sync_playwright
 # CONFIGURAÇÃO
 # ----------------------------------------------------------------------
 
-LOGIN_URL = "https://associado.appai.org.br/autenticar.aspx?ReturnUrl=/"
+LOGIN_URL = "https://associado.appai.org.br/caminhadas-e-corridas"
 TARGET_URL = "https://associado.appai.org.br/caminhadas-e-corridas"
 
 STATE_FILE = Path("state.json")
@@ -44,17 +44,28 @@ APPAI_PASS = os.environ.get("APPAI_PASS")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# Seletores do formulário de login. Baseados no padrão comum de portais
-# ASP.NET (autenticar.aspx). Se o login falhar, rode discover.py com
-# DEBUG_LOGIN=1 para salvar um screenshot da tela de login e ajustar aqui.
+# O Portal do Associado redireciona (via JS) para um servidor de login à
+# parte: segurancaapi.appai.org.br, um sistema OAuth/OpenID (IdentityServer).
+# Os nomes de campo abaixo cobrem os padrões mais comuns desse tipo de tela.
 LOGIN_FIELD_CANDIDATES = [
-    "input[type='text']",
+    "input[name='Username']",
+    "input[id='Username']",
+    "input[name='Input.Username']",
+    "input[id='Input_Username']",
     "input[name*='matricula' i]",
     "input[id*='matricula' i]",
     "input[name*='usuario' i]",
-    "input[id*='login' i]",
+    "input[id*='usuario' i]",
+    "input[name*='user' i]",
+    "input[id*='user' i]",
+    "input[type='email']",
+    "input[type='text']",
 ]
 PASSWORD_FIELD_CANDIDATES = [
+    "input[name='Password']",
+    "input[id='Password']",
+    "input[name='Input.Password']",
+    "input[id='Input_Password']",
     "input[type='password']",
 ]
 SUBMIT_CANDIDATES = [
@@ -98,6 +109,30 @@ def normalize_text(raw: str) -> str:
     return "\n".join(lines)
 
 
+def find_login_fields(page):
+    """Procura os campos de usuário/senha na página principal E dentro de
+    qualquer iframe (alguns portais colocam o formulário de login em um
+    iframe, o que faz a página "principal" parecer vazia)."""
+    frames_to_try = [page] + list(page.frames)
+    for frame in frames_to_try:
+        try:
+            user_loc = None
+            for sel in LOGIN_FIELD_CANDIDATES:
+                if frame.locator(sel).count() > 0:
+                    user_loc = frame.locator(sel).first
+                    break
+            pass_loc = None
+            for sel in PASSWORD_FIELD_CANDIDATES:
+                if frame.locator(sel).count() > 0:
+                    pass_loc = frame.locator(sel).first
+                    break
+            if user_loc and pass_loc:
+                return user_loc, pass_loc, frame
+        except Exception:
+            continue
+    return None, None, None
+
+
 def login_and_get_text() -> str:
     if not APPAI_USER or not APPAI_PASS:
         log("ERRO: defina as variáveis de ambiente APPAI_USER e APPAI_PASS.")
@@ -105,44 +140,76 @@ def login_and_get_text() -> str:
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context(locale="pt-BR")
+        context = browser.new_context(
+            locale="pt-BR",
+            viewport={"width": 1366, "height": 900},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+            ),
+        )
         page = context.new_page()
+        page.on("console", lambda msg: log(f"[console:{msg.type}] {msg.text}"))
+        page.on("pageerror", lambda err: log(f"[pageerror] {err}"))
 
         log(f"Abrindo {LOGIN_URL}")
-        page.goto(LOGIN_URL, wait_until="networkidle", timeout=60000)
+        page.goto(LOGIN_URL, wait_until="load", timeout=60000)
 
-        # tenta achar campo de usuário e senha
-        user_field = None
-        for sel in LOGIN_FIELD_CANDIDATES:
-            if page.locator(sel).count() > 0:
-                user_field = page.locator(sel).first
-                break
-        pass_field = None
-        for sel in PASSWORD_FIELD_CANDIDATES:
-            if page.locator(sel).count() > 0:
-                pass_field = page.locator(sel).first
-                break
+        # A página tenta redirecionar via JS para segurancaapi.appai.org.br
+        # (tela de login OAuth). Esperamos essa troca de URL acontecer.
+        try:
+            page.wait_for_url(re.compile(r"segurancaapi\.appai\.org\.br"), timeout=20000)
+            log("Redirecionado para o servidor de login (segurancaapi).")
+        except Exception:
+            log("Não foi redirecionado automaticamente para segurancaapi dentro do tempo esperado.")
+
+        try:
+            page.wait_for_load_state("networkidle", timeout=20000)
+        except Exception:
+            log("networkidle não atingido a tempo, seguindo mesmo assim.")
+        page.wait_for_timeout(3000)
+
+        # Diagnóstico sempre impresso no log, ajuda a entender o que a página
+        # realmente carregou nesta execução.
+        log(f"URL atual: {page.url}")
+        log(f"Título da página: {page.title()!r}")
+        log(f"Nº de <input> na página principal: {page.locator('input').count()}")
+        log(f"Nº de iframes na página: {len(page.frames) - 1}")
+        for i, fr in enumerate(page.frames):
+            if fr is page.main_frame:
+                continue
+            log(f"  iframe[{i}] url={fr.url}")
+
+        user_field, pass_field, login_frame = find_login_fields(page)
 
         if not user_field or not pass_field:
             page.screenshot(path="login_debug.png", full_page=True)
-            log("Não encontrei os campos de login automaticamente. "
-                "Screenshot salvo em login_debug.png para ajuste manual dos seletores.")
+            with open("login_debug.html", "w", encoding="utf-8") as f:
+                f.write(page.content())
+            log("Não encontrei os campos de login automaticamente (nem em iframes). "
+                "Screenshot e HTML salvos em login_debug.png / login_debug.html.")
             sys.exit(1)
 
+        log("Campos de login encontrados, preenchendo...")
         user_field.fill(APPAI_USER)
         pass_field.fill(APPAI_PASS)
 
         submitted = False
         for sel in SUBMIT_CANDIDATES:
-            if page.locator(sel).count() > 0:
-                page.locator(sel).first.click()
+            if login_frame.locator(sel).count() > 0:
+                login_frame.locator(sel).first.click()
                 submitted = True
                 break
         if not submitted:
             pass_field.press("Enter")
 
-        page.wait_for_load_state("networkidle", timeout=60000)
+        try:
+            page.wait_for_load_state("networkidle", timeout=30000)
+        except Exception:
+            log("networkidle não atingido após login, seguindo mesmo assim.")
+        page.wait_for_timeout(2000)
         log("Login enviado.")
+        log(f"URL após login: {page.url}")
 
         log(f"Abrindo {TARGET_URL}")
         page.goto(TARGET_URL, wait_until="networkidle", timeout=60000)

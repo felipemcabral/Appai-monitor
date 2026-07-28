@@ -3,7 +3,7 @@ name: Monitorar Caminhadas e Corridas (Appai)
 on:
   schedule:
     # roda a cada 3 horas (horário UTC). Ajuste conforme quiser.
-    - cron: "0 */3 * * *"
+    - cron: "*/30 * * * *"
   workflow_dispatch: {}   # permite rodar manualmente pela aba "Actions"
 
 permissions:
